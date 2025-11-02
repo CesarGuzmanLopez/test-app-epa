@@ -36,10 +36,9 @@ def get_endpoints_from_description(endpoints_desc: Dict) -> List[Tuple[str, str]
 
 
 def build_command(
-    java_bin: str, input_path: str, out_path: str, endpoint: str, script_dir: str
+    java_bin: str, input_path: str, out_path: str, endpoint: str, jar_path: str
 ) -> List[str]:
     """Build command for running T.E.S.T. endpoint."""
-    jar_path = os.path.join(script_dir, "WebTEST.jar")
     return [
         java_bin,
         "-cp",
@@ -107,9 +106,9 @@ def load_binary_as_b64(path: str) -> str:
 class EndpointJobRunner:
     """Handles the execution and output processing of endpoint jobs."""
 
-    def __init__(self, args, script_dir: str, java_bin: str, xvfb_path: Optional[str]):
+    def __init__(self, args, jar_path: str, java_bin: str, xvfb_path: Optional[str]):
         self.args = args
-        self.script_dir = script_dir
+        self.jar_path = jar_path
         self.java_bin = java_bin
         self.xvfb_path = xvfb_path
 
@@ -131,11 +130,12 @@ class EndpointJobRunner:
 
             # Build command
             base_cmd = build_command(
-                self.java_bin, inp_path, out_path, endpoint, self.script_dir
+                self.java_bin, inp_path, out_path, endpoint, self.jar_path
             )
 
+            # Use xvfb if available on Linux (to prevent GUI windows)
             cmd = base_cmd
-            if self.xvfb_path:
+            if self.xvfb_path and not self.args.no_xvfb:
                 cmd = [
                     self.xvfb_path,
                     "-n",
@@ -149,7 +149,9 @@ class EndpointJobRunner:
                     "out_name": out_filename,
                     "out_path": out_path,
                     "cmd": cmd,
-                    "cwd": self.script_dir,
+                    "cwd": os.path.dirname(
+                        self.jar_path
+                    ),  # Use jar directory as working dir
                 }
             )
 
@@ -180,6 +182,7 @@ class EndpointJobRunner:
                     "stderr": res.get("stderr", ""),
                 }
 
+                # Handle xvfb cleanup errors (Linux) or wait for output file
                 stderr = res.get("stderr", "")
                 is_xvfb_cleanup_error = (
                     res["rc"] == 1
@@ -190,6 +193,8 @@ class EndpointJobRunner:
 
                 if is_xvfb_cleanup_error:
                     self._handle_xvfb_cleanup(job, results, ep)
+                elif res["rc"] != 0 and not os.path.exists(job["out_path"]):
+                    self._wait_for_output_file(job, results, ep)
 
         return results
 
@@ -211,46 +216,114 @@ class EndpointJobRunner:
             results[ep]["rc"] = 0
             results[ep]["stderr"] = "xvfb-run cleanup error ignored"
 
+    def _wait_for_output_file(self, job: Dict, results: Dict, ep: str) -> None:
+        """Wait for output file to appear (cross-platform replacement for xvfb handling)."""
+        # Wait for file
+        file_appeared = False
+        for _ in range(20):
+            time.sleep(0.5)
+            if (
+                os.path.exists(job["out_path"])
+                and os.path.isfile(job["out_path"])
+                and os.path.getsize(job["out_path"]) > 0
+            ):
+                file_appeared = True
+                break
+
+        if file_appeared:
+            results[ep]["rc"] = 0
+            results[ep]["stderr"] = "Output file appeared after initial failure"
+
 
 class TESTRunner:
     """Main class for running T.E.S.T. predictions."""
 
     def __init__(self, args):
         self.args = args
-        self.script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.python_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.jar_path = self._find_webtest_jar()
         self.java_bin = self._resolve_java_binary()
         self.xvfb_path = self._resolve_xvfb()
         self.endpoints_desc = self._get_filtered_endpoints()
 
+    def _find_webtest_jar(self) -> str:
+        """Find WebTEST.jar relative to python directory (cross-platform)."""
+        # Look for WebTEST.jar in python directory first
+        jar_in_python = os.path.join(self.python_dir, "WebTEST.jar")
+        if os.path.exists(jar_in_python):
+            return jar_in_python
+
+        # Look one level up (project root)
+        project_root = os.path.dirname(self.python_dir)
+        jar_in_root = os.path.join(project_root, "WebTEST.jar")
+        if os.path.exists(jar_in_root):
+            return jar_in_root
+
+        # Look in target directory (Maven build)
+        jar_in_target = os.path.join(project_root, "target", "WebTEST.jar")
+        if os.path.exists(jar_in_target):
+            return jar_in_target
+
+        raise FileNotFoundError(
+            f"WebTEST.jar not found. Searched in:\n"
+            f"  {jar_in_python}\n"
+            f"  {jar_in_root}\n"
+            f"  {jar_in_target}\n"
+            "Please ensure WebTEST.jar is in the python/ directory or project root."
+        )
+
     def _resolve_java_binary(self) -> str:
-        """Resolve and validate Java binary path."""
+        """Resolve and validate Java binary path (cross-platform)."""
         java_candidate = self.args.java
         java_bin_resolved = None
 
+        # On Windows, try both 'java' and 'java.exe'
+        candidates = [java_candidate]
+        if os.name == "nt" and not java_candidate.endswith(".exe"):
+            candidates.append(java_candidate + ".exe")
+
         if os.path.isabs(java_candidate) or (os.path.sep in java_candidate):
-            if os.path.isfile(java_candidate) and os.access(java_candidate, os.X_OK):
-                java_bin_resolved = java_candidate
-            else:
-                found = shutil.which(os.path.basename(java_candidate))
+            # Absolute or relative path provided
+            for candidate in candidates:
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    java_bin_resolved = candidate
+                    break
+            if not java_bin_resolved:
+                # Try to find in PATH with basename
+                for candidate in candidates:
+                    found = shutil.which(os.path.basename(candidate))
+                    if found:
+                        java_bin_resolved = found
+                        break
+        else:
+            # Just a binary name, search in PATH
+            for candidate in candidates:
+                found = shutil.which(candidate)
                 if found:
                     java_bin_resolved = found
-        else:
-            found = shutil.which(java_candidate)
-            if found:
-                java_bin_resolved = found
+                    break
 
         if not java_bin_resolved:
-            msg = "Java binary not found. Provide a correct --java path or install java in PATH"
+            msg = (
+                f"Java binary not found. Tried: {candidates}\n"
+                "Please provide a correct --java path or install java in PATH.\n"
+                "On Windows, try 'java.exe'. On Unix/Mac, try 'java'."
+            )
             raise ValueError(msg)
 
         return java_bin_resolved
 
     def _resolve_xvfb(self) -> Optional[str]:
-        """Resolve xvfb-run path."""
-        if not self.args.no_xvfb:
+        """Resolve xvfb-run path (Linux only, optional)."""
+        if self.args.no_xvfb:
+            return None
+
+        # Only try xvfb on Unix-like systems
+        if os.name == "posix":
             xvfb_path = shutil.which("xvfb-run")
             if not xvfb_path:
-                print("Warning: 'xvfb-run' not found in PATH. Will run java directly.")
+                # Silent fallback - no warning needed
+                pass
             return xvfb_path
         return None
 
@@ -274,7 +347,7 @@ class TESTRunner:
         # Generate unique ID
         unique_id = str(uuid.uuid4())[:8]
 
-        # Prepare tmp directory
+        # Prepare tmp directory (cross-platform temp handling)
         tmp_root = (
             self.args.tmp_dir
             if self.args.tmp_dir
@@ -305,7 +378,7 @@ class TESTRunner:
         # Get endpoints and prepare jobs
         commands = get_endpoints_from_description(self.endpoints_desc)
         runner = EndpointJobRunner(
-            self.args, self.script_dir, self.java_bin, self.xvfb_path
+            self.args, self.jar_path, self.java_bin, self.xvfb_path
         )
         jobs = runner.prepare_jobs(commands, unique_id, tmpdir, inp_path)
         results = runner.execute_jobs(jobs)
