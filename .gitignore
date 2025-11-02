@@ -30,3 +30,5 @@ output.txt
 smiles.csv
 Smiles.smi
 script.zip
+test/__pycache__
+**/__pycache__/**
