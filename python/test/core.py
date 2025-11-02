@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from .models import EndpointResult, MoleculeResult, TestResults
 from .utils import collect_smiles, ensure_dir, write_smiles_file
 
 
@@ -309,70 +310,77 @@ class TESTRunner:
         jobs = runner.prepare_jobs(commands, unique_id, tmpdir, inp_path)
         results = runner.execute_jobs(jobs)
 
-        # Process outputs
-        molecules_data = {}
+        # Process outputs into typed objects
+        molecules_map: Dict[int, MoleculeResult] = {}
 
-        # Initialize molecule data
+        # Initialize molecule data (index starts at 1)
         for idx, smiles in enumerate(smiles_all, 1):
-            molecules_data[idx] = {"smiles": smiles, "properties": {}}
+            molecules_map[idx] = MoleculeResult(smiles=smiles, properties={})
 
-        # Process all endpoint outputs
+        # Process all endpoint outputs and classify into EndpointResult
         for endpoint, meta in results.items():
             path = meta.get("out_path")
             desc = self.endpoints_desc.get(endpoint, {})
 
             # Handle output file
-            if os.path.exists(path) and os.path.isfile(path):
+            if path and os.path.exists(path) and os.path.isfile(path):
                 try:
-                    # Parse output file
                     parsed = try_parse_csv(path)
 
-                    # Handle CSV data
                     if parsed.get("type") == "csv" and parsed.get("data"):
                         for row in parsed["data"]:
-                            mol_idx = int(row.get("Index", 0))
-                            if mol_idx in molecules_data:
-                                molecules_data[mol_idx]["properties"][endpoint] = {
-                                    "name": desc.get("name", endpoint),
-                                    "unit": desc.get("unit", "N/A"),
-                                    "description": desc.get("description", ""),
-                                    "application": desc.get("application", ""),
-                                    "row_data": row,
-                                }
+                            try:
+                                mol_idx = int(row.get("Index", 0))
+                            except Exception:
+                                mol_idx = 0
+                            if mol_idx in molecules_map:
+                                ep_res = EndpointResult.from_row_data(row, desc)
+                                molecules_map[mol_idx].properties[endpoint] = ep_res
                     else:
-                        # Non-CSV data - assign to all molecules
-                        for mol_idx in molecules_data:
-                            molecules_data[mol_idx]["properties"][endpoint] = {
-                                "name": desc.get("name", endpoint),
-                                "unit": desc.get("unit", "N/A"),
-                                "description": desc.get("description", ""),
-                                "application": desc.get("application", ""),
-                                "parsed": parsed,
-                            }
+                        # Non-CSV - attach parsed blob to each molecule as raw_data
+                        for mol_idx in molecules_map:
+                            molecules_map[mol_idx].properties[endpoint] = (
+                                EndpointResult(
+                                    name=desc.get("name", endpoint),
+                                    unit=desc.get("unit", "N/A"),
+                                    description=desc.get("description", ""),
+                                    application=desc.get("application", ""),
+                                    value=None,
+                                    error=None,
+                                    raw_data=parsed,
+                                )
+                            )
 
                 except Exception as e:
-                    # Error parsing file
-                    for mol_idx in molecules_data:
-                        molecules_data[mol_idx]["properties"][endpoint] = {
-                            "name": desc.get("name", endpoint),
-                            "unit": desc.get("unit", "N/A"),
-                            "description": desc.get("description", ""),
-                            "application": desc.get("application", ""),
-                            "error": str(e),
-                        }
+                    for mol_idx in molecules_map:
+                        molecules_map[mol_idx].properties[endpoint] = EndpointResult(
+                            name=desc.get("name", endpoint),
+                            unit=desc.get("unit", "N/A"),
+                            description=desc.get("description", ""),
+                            application=desc.get("application", ""),
+                            value=None,
+                            error=str(e),
+                            raw_data=None,
+                        )
             else:
-                # Missing output file
-                for mol_idx in molecules_data:
-                    molecules_data[mol_idx]["properties"][endpoint] = {
-                        "name": desc.get("name", endpoint),
-                        "unit": desc.get("unit", "N/A"),
-                        "description": desc.get("description", ""),
-                        "application": desc.get("application", ""),
-                    }
+                # Missing output file - mark as missing in raw_data
+                for mol_idx in molecules_map:
+                    molecules_map[mol_idx].properties[endpoint] = EndpointResult(
+                        name=desc.get("name", endpoint),
+                        unit=desc.get("unit", "N/A"),
+                        description=desc.get("description", ""),
+                        application=desc.get("application", ""),
+                        value=None,
+                        error=None,
+                        raw_data={"missing": True},
+                    )
 
-        # Build final results
-        final = {
-            "metadata": {
+        # Build final typed results and convert to dict for compatibility
+        ordered_molecules = [molecules_map[k] for k in sorted(molecules_map.keys())]
+
+        final_results = TestResults(
+            molecules=ordered_molecules,
+            metadata={
                 "version": "1.0",
                 "timestamp": datetime.now().isoformat(),
                 "tool": "T.E.S.T. Runner",
@@ -380,8 +388,7 @@ class TESTRunner:
                 "workers": self.args.workers,
                 "timeout_sec": self.args.timeout,
             },
-            "input": {"smiles_count": len(smiles_all), "smiles": smiles_all},
-            "diagnostics": {
+            diagnostics={
                 "tmpdir": tmpdir,
                 "uuid": unique_id,
                 "input_file": inp_path,
@@ -404,8 +411,9 @@ class TESTRunner:
                     else f"Temporary files will be deleted after execution. Located in: {tmpdir}"
                 ),
             },
-            "molecules": molecules_data,
-        }
+        )
+
+        final = final_results.to_dict()
 
         # Clean up if not keeping temporary files
         if not self.args.keep_tmp:
