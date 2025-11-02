@@ -1,3 +1,10 @@
 databases
 databases/*.db
 WebTEST.jar
+#ignorar todo lo de python como __pycache__
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+__pycache__/*
